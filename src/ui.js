@@ -236,6 +236,15 @@ export function getHtmlPage(domain) {
         .replace(/'/g, '&#039;');
     }
 
+    // 将邮件 HTML 中的 http:// 资源引用升级为 https://，消除 Mixed Content 告警
+    // （仅重写 src/href 等属性与 CSS url()，不改动正文可见文本）
+    // 注意：本文件是模板字符串，正则中的反斜杠必须双写（\\s、\\/ 等）
+    function upgradeToHttps(html) {
+      return String(html || '')
+        .replace(/(src|href|poster|background)\\s*=\\s*(["'])http:\\/\\//gi, '$1=$2https://')
+        .replace(/url\\(\\s*(["']?)http:\\/\\//gi, 'url($1https://');
+    }
+
     async function createNewMailbox() {
       try {
         const res = await fetch('/api/mailbox/create', { method: 'POST' });
@@ -347,7 +356,7 @@ export function getHtmlPage(domain) {
             const iframe = document.createElement('iframe');
             iframe.className = 'email-frame';
             iframe.sandbox = 'allow-popups';
-            iframe.srcdoc = mail.content_html;
+            iframe.srcdoc = upgradeToHttps(mail.content_html);
             frameContainer.appendChild(iframe);
           } else {
             const pre = document.createElement('pre');
