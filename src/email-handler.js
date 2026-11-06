@@ -3,6 +3,16 @@
  */
 import PostalMime from 'postal-mime';
 import { extractVerificationCode } from './code-extractor.js';
+import {
+  hashSender,
+  ruleKey,
+  getRule,
+  matchRule,
+  recordHit,
+  buildRuleFromAI,
+  putRule
+} from './rule-store.js';
+import { extractWithAI } from './ai-extractor.js';
 
 export async function handleIncomingEmail(message, env, ctx) {
   const toAddress = message.to.toLowerCase().trim();
@@ -40,8 +50,50 @@ export async function handleIncomingEmail(message, env, ctx) {
     textBody = rawText.slice(0, 5000);
   }
 
-  // 4. 提取验证码
-  const verificationCode = extractVerificationCode(subject, textBody, htmlBody);
+  // 4. 提取验证码（三层流水线：本地正则 -> KV 已学习规则 -> AI 大模型兜底）
+  let verificationCode = extractVerificationCode(subject, textBody, htmlBody);
+  let aiExtracted = false;
+
+  if (!verificationCode) {
+    // 第 2 层：KV 已学习规则匹配（按发信方域名/From 地址检索规则）
+    const fromDomain = extractDomain(fromAddress);
+    const senderHash = await hashSender(fromAddress);
+    const key = ruleKey(fromDomain, senderHash);
+    const rule = await getRule(env, key);
+
+    if (rule) {
+      const matched = matchRule(rule, { subject, textBody, htmlBody });
+      if (matched && matched.code) {
+        verificationCode = matched.code;
+        // 记录命中并持久化（hits+1、lastHitAt），不阻塞主流程
+        ctx.waitUntil(recordHit(env, key, rule, matched.patternIndex));
+      }
+    }
+  }
+
+  if (!verificationCode) {
+    // 第 3 层：AI 大模型兜底提取（仅前两层都失败时调用）
+    const aiResult = await extractWithAI(env, { subject, textBody, htmlBody });
+    aiExtracted = aiResult.usedAI;
+    if (aiResult.code) {
+      verificationCode = aiResult.code;
+
+      // 自学习：AI 成功提取后，将模式持久化为 KV 规则，下次同类邮件直接命中
+      // 仅当 KV 中不存在该发信方的规则时自动生成（与设计 5.1 一致）
+      const existingRule = await getRule(env, key);
+      if (!existingRule) {
+        const newRule = buildRuleFromAI({
+          sender: fromAddress,
+          domain: fromDomain,
+          subject,
+          textBody,
+          htmlBody,
+          code: aiResult.code
+        });
+        ctx.waitUntil(putRule(env, key, newRule));
+      }
+    }
+  }
 
   // 5. 组装邮件实体
   const messageId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
@@ -81,4 +133,14 @@ export async function handleIncomingEmail(message, env, ctx) {
       { expirationTtl: ttl }
     );
   })());
+}
+
+/**
+ * 从 From 地址中提取邮箱域名（如 security@example.com -> example.com）
+ * 失败时返回 'unknown'，避免 KV key 污染
+ */
+function extractDomain(fromAddress) {
+  if (!fromAddress) return 'unknown';
+  const match = String(fromAddress).match(/@([^@\s>]+)$/i);
+  return match ? match[1].toLowerCase().trim() : 'unknown';
 }

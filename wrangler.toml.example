@@ -10,3 +10,12 @@ preview_id = "你的预览_KV_ID"
 [vars]
 DOMAIN = "你的域名.com"           # 替换为你的真实域名
 MAIL_TTL_SECONDS = 1800            # 邮件保留时间（秒），默认 30 分钟
+
+# ──── AI 自学习验证码提取（可选）────
+# 通过 Cloudflare 密钥存储或 wrangler.toml 的 [vars] 配置，严禁写入代码或提交到 Git
+AI_PROVIDER = "openai"             # openai / zhipu / deepseek / cloudflare
+AI_API_KEY = "sk-your-api-key"     # 替换为你的真实密钥
+AI_API_BASE = "https://api.openai.com/v1"
+AI_MODEL = "gpt-3.5-turbo"
+AI_MAX_DAILY_CALLS = 100           # 每日最大 AI 调用次数
+AI_CONFIDENCE_THRESHOLD = 0.6      # 接受 AI 结果的最低置信度
