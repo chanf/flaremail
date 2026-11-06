@@ -1,0 +1,29 @@
+{
+  "name": "flaremail",
+  "version": "1.0.0",
+  "description": "FlareMail - Serverless Disposable Temporary Email & Verification Code Receiver built on Cloudflare Workers",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "flaremail",
+    "cloudflare",
+    "workers",
+    "temp-mail",
+    "disposable-email",
+    "email-routing",
+    "serverless"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "postal-mime": "^2.1.6"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}

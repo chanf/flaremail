@@ -1,0 +1,13 @@
+name = "flaremail"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+account_id = "474c9bf7a4ff6bee5ae1f8f69da58c2c"
+
+[[kv_namespaces]]
+binding = "MAIL_KV"
+id = "20579ce0fe2f4ba4a4719619114d4854"
+preview_id = "90da92cd65464a469b45effd36ed9d47"
+
+[vars]
+DOMAIN = "tpxul.com"              # 替换为你的真实域名
+MAIL_TTL_SECONDS = 1800                 # 邮件保留时间（秒），默认 30 分钟
