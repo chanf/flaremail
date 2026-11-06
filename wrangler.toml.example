@@ -1,0 +1,12 @@
+name = "flaremail"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "MAIL_KV"
+id = "你的生产_KV_ID"
+preview_id = "你的预览_KV_ID"
+
+[vars]
+DOMAIN = "你的域名.com"           # 替换为你的真实域名
+MAIL_TTL_SECONDS = 1800            # 邮件保留时间（秒），默认 30 分钟
