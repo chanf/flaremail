@@ -4,7 +4,7 @@
  */
 import { handleIncomingEmail } from './email-handler.js';
 import { handleApiRequest } from './api-handler.js';
-import { getHtmlPage } from './ui.js';
+import { getHtmlPage, getAdminPage } from './ui.js';
 
 export default {
   // 1. 邮件接收事件处理器
@@ -30,6 +30,17 @@ export default {
     // 后端 RESTful API 路由处理
     if (url.pathname.startsWith('/api/')) {
       return await handleApiRequest(request, env, ctx);
+    }
+
+    // 管理页面（AI 工作日志 / 规则升级历史）
+    if (url.pathname === '/admin' || url.pathname === '/admin.html') {
+      const html = getAdminPage(env.DOMAIN || 'example.com');
+      return new Response(html, {
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-cache'
+        }
+      });
     }
 
     return new Response('404 Not Found', { status: 404 });

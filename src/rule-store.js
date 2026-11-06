@@ -119,6 +119,29 @@ function findCodeInText(text) {
 }
 
 /**
+ * 在窗口文本内按给定正则寻找验证码，优先纯数字候选，其次含数字的混合码。
+ * 纯字母候选一律拒绝（几乎都是普通单词，如品牌名/收件人名）。
+ * 返回原始匹配 token 或 null
+ */
+function findCodeInWindow(windowText, regex) {
+  if (!windowText) return null;
+  const matches = windowText.match(regex);
+  if (!matches) return null;
+  const clean = (c) => c.replace(/^[A-Z]-/i, '').replace(/-/g, '');
+  // 1. 纯数字候选优先
+  for (const c of matches) {
+    const raw = clean(c);
+    if (/^\d+$/.test(raw) && isValidCode(raw)) return c;
+  }
+  // 2. 含数字的字母数字混合候选
+  for (const c of matches) {
+    const raw = clean(c);
+    if (/\d/.test(raw) && isValidCode(raw)) return c;
+  }
+  return null;
+}
+
+/**
  * 剥离 HTML 标签为纯文本
  */
 function stripHtml(html) {
@@ -191,22 +214,20 @@ function tryPattern(pattern, { subject, textBody, htmlBody }) {
     const idx = text.toLowerCase().indexOf(keyword.toLowerCase());
     if (idx === -1) return null;
     const windowSize = 120;
-    const windowText = text.substring(
-      Math.max(0, idx - windowSize),
-      Math.min(text.length, idx + keyword.length + windowSize)
-    );
     let regex;
     try {
       regex = new RegExp(regexStr, 'gi');
     } catch {
-      regex = /(\d{4,8})/g;
+      regex = /([A-Za-z0-9]{4,8})/g;
     }
-    const m = windowText.match(regex);
-    if (m) {
-      const raw = m[0].replace(/^[A-Z]-/i, '').replace(/-/g, '');
-      if (isValidCode(raw)) return { code: m[0], confidence };
-    }
-    return null;
+    // 验证码通常紧跟关键词之后：先只搜关键词后方窗口，找不到再回退前方窗口
+    const afterWindow = text.substring(
+      Math.min(text.length, idx + keyword.length),
+      Math.min(text.length, idx + keyword.length + windowSize)
+    );
+    const hit = findCodeInWindow(afterWindow, regex) ||
+      findCodeInWindow(text.substring(Math.max(0, idx - windowSize), idx), regex);
+    return hit ? { code: hit, confidence } : null;
   }
 
   if (type === 'subject-template') {
@@ -274,9 +295,10 @@ export async function recordHit(env, key, rule, patternIndex) {
 /**
  * 根据 AI 成功提取的上下文，推断 pattern 类型并构建初始规则值
  * 用于自学习：AI 成功提取后，将模式持久化为 KV 规则，下次同类邮件直接命中
+ * hint：AI 返回的「紧挨验证码之前的原文短语」，是最精准的 keyword-context 来源
  * 返回规则值对象（不含 senderHash，由调用方拼入 KV key）
  */
-export function buildRuleFromAI({ sender, domain, subject, textBody, htmlBody, code }) {
+export function buildRuleFromAI({ sender, domain, subject, textBody, htmlBody, code, hint }) {
   const now = Date.now();
   const patterns = [];
 
@@ -294,19 +316,45 @@ export function buildRuleFromAI({ sender, domain, subject, textBody, htmlBody, c
     });
   }
 
-  // 场景：代码紧跟关键词（如 "验证码：123456"） → keyword-context
+  // 场景 1（最优）：AI 给出的紧邻上下文短语 hint → keyword-context
   const text = (textBody || '') + '\n' + stripHtml(htmlBody || '');
-  const keywordRegex = /(验证码|校验码|动态码|verification\s*code|security\s*code|auth\s*code|your\s*code|code\s*is|code\s*[:：])/i;
-  const kwMatch = text.match(keywordRegex);
-  if (kwMatch) {
+  if (hint && hint.trim().length >= 2 && text.toLowerCase().includes(hint.toLowerCase())) {
     patterns.push({
       type: 'keyword-context',
-      keyword: kwMatch[0],
+      keyword: hint.trim(),
       regex: '([A-Za-z0-9]{4,8})',
-      confidence: 0.85,
+      confidence: 0.95,
       hits: 1,
       lastHitAt: now
     });
+  }
+
+  // 场景 2（hint 缺失时兜底）：选取「最靠近验证码前方」的关键词短语
+  if (patterns.every(p => p.type !== 'keyword-context')) {
+    const keywordRegex = /(验证码|校验码|动态码|动态密码|口令|verification\s*code|security\s*code|auth\s*code|your\s*code|code\s*is|code\s*[:：]|passcode|one[-\s]?time)/gi;
+    const codeIdx = text.indexOf(code);
+    let bestKw = null;
+    if (codeIdx !== -1) {
+      let km;
+      keywordRegex.lastIndex = 0;
+      while ((km = keywordRegex.exec(text)) !== null) {
+        if (km.index < codeIdx && (!bestKw || km.index > bestKw.index)) {
+          bestKw = km;
+        }
+      }
+    } else {
+      bestKw = text.match(new RegExp(keywordRegex.source, 'i'));
+    }
+    if (bestKw) {
+      patterns.push({
+        type: 'keyword-context',
+        keyword: bestKw[0],
+        regex: '([A-Za-z0-9]{4,8})',
+        confidence: 0.85,
+        hits: 1,
+        lastHitAt: now
+      });
+    }
   }
 
   // 场景：代码位于带 class 的 HTML 标签内 → html-class

@@ -1,5 +1,12 @@
 /**
  * 邮件接收与 MIME 解包逻辑
+ *
+ * 验证码提取采用「发件方登记制」：
+ * - 每个发件方（From 地址）首次来信时，必须调用 AI 提取验证码，
+ *   并由 AI 结果生成该发件方的提取规则，登记到 KV；
+ * - 该发件方后续来信直接用已登记规则提取，不再过 AI；
+ * - 已登记规则未命中（模板变化）时，重新过 AI 更新规则（自愈）；
+ * - AI 失败 / 每日超限时，降级用本地正则兜底（不登记规则）。
  */
 import PostalMime from 'postal-mime';
 import { extractVerificationCode } from './code-extractor.js';
@@ -10,9 +17,10 @@ import {
   matchRule,
   recordHit,
   buildRuleFromAI,
-  putRule
+  putRule,
+  extractDomain
 } from './rule-store.js';
-import { extractWithAI } from './ai-extractor.js';
+import { extractWithAI, saveAiLog } from './ai-extractor.js';
 
 export async function handleIncomingEmail(message, env, ctx) {
   const toAddress = message.to.toLowerCase().trim();
@@ -27,7 +35,7 @@ export async function handleIncomingEmail(message, env, ctx) {
 
   // 2. 读取原始邮件二进制流
   const rawStream = await new Response(message.raw).arrayBuffer();
-  
+
   let subject = '(无主题)';
   let senderName = fromAddress;
   let textBody = '';
@@ -50,50 +58,15 @@ export async function handleIncomingEmail(message, env, ctx) {
     textBody = rawText.slice(0, 5000);
   }
 
-  // 4. 提取验证码（三层流水线：本地正则 -> KV 已学习规则 -> AI 大模型兜底）
-  let verificationCode = extractVerificationCode(subject, textBody, htmlBody);
-  let aiExtracted = false;
+  // 4. 按发件方登记制提取验证码
+  const result = await extractCodeForSender(env, {
+    fromAddress,
+    subject,
+    textBody,
+    htmlBody
+  }, (p) => ctx.waitUntil(p));
 
-  if (!verificationCode) {
-    // 第 2 层：KV 已学习规则匹配（按发信方域名/From 地址检索规则）
-    const fromDomain = extractDomain(fromAddress);
-    const senderHash = await hashSender(fromAddress);
-    const key = ruleKey(fromDomain, senderHash);
-    const rule = await getRule(env, key);
-
-    if (rule) {
-      const matched = matchRule(rule, { subject, textBody, htmlBody });
-      if (matched && matched.code) {
-        verificationCode = matched.code;
-        // 记录命中并持久化（hits+1、lastHitAt），不阻塞主流程
-        ctx.waitUntil(recordHit(env, key, rule, matched.patternIndex));
-      }
-    }
-  }
-
-  if (!verificationCode) {
-    // 第 3 层：AI 大模型兜底提取（仅前两层都失败时调用）
-    const aiResult = await extractWithAI(env, { subject, textBody, htmlBody });
-    aiExtracted = aiResult.usedAI;
-    if (aiResult.code) {
-      verificationCode = aiResult.code;
-
-      // 自学习：AI 成功提取后，将模式持久化为 KV 规则，下次同类邮件直接命中
-      // 仅当 KV 中不存在该发信方的规则时自动生成（与设计 5.1 一致）
-      const existingRule = await getRule(env, key);
-      if (!existingRule) {
-        const newRule = buildRuleFromAI({
-          sender: fromAddress,
-          domain: fromDomain,
-          subject,
-          textBody,
-          htmlBody,
-          code: aiResult.code
-        });
-        ctx.waitUntil(putRule(env, key, newRule));
-      }
-    }
-  }
+  const verificationCode = result.code;
 
   // 5. 组装邮件实体
   const messageId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
@@ -136,11 +109,80 @@ export async function handleIncomingEmail(message, env, ctx) {
 }
 
 /**
- * 从 From 地址中提取邮箱域名（如 security@example.com -> example.com）
- * 失败时返回 'unknown'，避免 KV key 污染
+ * 发件方登记制提取核心（独立导出，便于测试）：
+ * 1. 查该发件方已登记规则 → 命中直接返回（不过 AI）
+ * 2. 首次（无规则）或规则未命中 → 调用 AI 提取并登记/更新规则
+ * 3. AI 失败/超限 → 降级本地正则兜底（不登记）
+ *
+ * 返回 { code, source: 'rule'|'ai'|'regex'|null, relearn: boolean, ai: aiResult }
  */
-function extractDomain(fromAddress) {
-  if (!fromAddress) return 'unknown';
-  const match = String(fromAddress).match(/@([^@\s>]+)$/i);
-  return match ? match[1].toLowerCase().trim() : 'unknown';
+export async function extractCodeForSender(env, { fromAddress, subject, textBody, htmlBody }, waitUntil = () => {}) {
+  const fromDomain = extractDomain(fromAddress);
+  const senderHash = await hashSender(fromAddress);
+  const key = ruleKey(fromDomain, senderHash);
+
+  // 1. 查该发件方已登记规则
+  const rule = await getRule(env, key);
+  if (rule) {
+    const matched = matchRule(rule, { subject, textBody, htmlBody });
+    if (matched && matched.code) {
+      // 命中：记录命中（hits+1、lastHitAt），不阻塞主流程
+      waitUntil(recordHit(env, key, rule, matched.patternIndex));
+      return { code: matched.code, source: 'rule', relearn: false, ai: null };
+    }
+  }
+
+  // 2. 首次（无规则）或规则未命中（模板变化）→ 过 AI 学习/重新学习
+  const aiResult = await extractWithAI(env, { subject, textBody, htmlBody });
+
+  if (aiResult.code) {
+    // 登记新规则 / 覆盖更新旧规则（自愈模板变化）；hint 为 AI 给出的紧邻上下文短语
+    const newRule = buildRuleFromAI({
+      sender: fromAddress,
+      domain: fromDomain,
+      subject,
+      textBody,
+      htmlBody,
+      code: aiResult.code,
+      hint: aiResult.hint
+    });
+    waitUntil(putRule(env, key, newRule));
+
+    waitUntil(saveAiLog(env, {
+      type: 'extract',
+      from: fromAddress,
+      domain: fromDomain,
+      subject,
+      aiExtracted: true,
+      extractedCode: aiResult.code,
+      confidence: aiResult.confidence || 0,
+      provider: aiResult.provider || 'external',
+      reason: (rule
+        ? '规则未命中（模板变化），AI 重新学习并更新登记：'
+        : '首次收到该发件方，AI 提取并登记规则：')
+        + `[${aiResult.provider === 'workers-ai' ? 'Workers AI 兜底' : '外部供应商'}] ${aiResult.reason || ''}`,
+      dailyLimitReached: false,
+      timestamp: Date.now()
+    }));
+
+    return { code: aiResult.code, source: 'ai', relearn: !!rule, ai: aiResult };
+  }
+
+  // 3. AI 失败/超限 → 降级本地正则兜底（不登记规则，下次继续尝试 AI）
+  const fallbackCode = extractVerificationCode(subject, textBody, htmlBody);
+
+  waitUntil(saveAiLog(env, {
+    type: 'extract',
+    from: fromAddress,
+    domain: fromDomain,
+    subject,
+    aiExtracted: aiResult.usedAI,
+    extractedCode: null,
+    confidence: 0,
+    reason: (aiResult.reason || 'AI 提取失败') + (fallbackCode ? `；已降级正则兜底提取到 ${fallbackCode}` : '；正则兜底也未提取到'),
+    dailyLimitReached: !aiResult.usedAI && aiResult.reason === 'AI 每日调用次数已达上限',
+    timestamp: Date.now()
+  }));
+
+  return { code: fallbackCode || null, source: fallbackCode ? 'regex' : null, relearn: !!rule, ai: aiResult };
 }

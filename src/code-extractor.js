@@ -66,8 +66,9 @@ function extractFormattedCode(text) {
 function extractFromHtmlElements(html) {
   const tagPatterns = [
     /<(?:b|strong|h[1-4]|code)[^>]*>\s*([A-Za-z0-9\s-]{4,10})\s*<\/(?:b|strong|h[1-4]|code)>/gi,
-    /style=["'][^"']*(?:font-size\s*:\s*(?:[1-4][0-9]px|1\.[5-9]em|2em|xx-large)|letter-spacing\s*:\s*[2-9]px)[^"']*>\s*([A-Za-z0-9\s-]{4,10})\s*</gi,
-    /class=["'][^"']*(?:verification.*?code|code.*?verification|code|otp|token|pin|verify)[^"']*>\s*([A-Za-z0-9\s-]{4,10})\s*</gi
+    // 注意：属性值以引号闭合，匹配时必须允许闭合引号出现在 ">" 之前
+    /style=["'][^"']*(?:font-size\s*:\s*(?:[1-4][0-9]px|1\.[5-9]em|2em|xx-large)|letter-spacing\s*:\s*[2-9]px)[^"']*["']?\s*>\s*([A-Za-z0-9\s-]{4,10})\s*</gi,
+    /class=["'][^"']*(?:verification.*?code|code.*?verification|code|otp|token|pin|verify)[^"']*["']?\s*>\s*([A-Za-z0-9\s-]{4,10})\s*</gi
   ];
 
   for (const pattern of tagPatterns) {
@@ -97,20 +98,38 @@ function extractByContextKeywords(text) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
+    if (!kwRegex.test(line)) continue;
 
-    if (kwRegex.test(line)) {
-      // 合并当前行与下一行，解决“验证码如下：\n 123456”单独换行的问题
-      const searchScope = line + ' ' + (lines[i + 1] ? lines[i + 1].trim() : '');
+    const nextLine = lines[i + 1] ? lines[i + 1].trim() : '';
 
-      const candidates = searchScope.match(/([A-Za-z0-9]{4,8}|[A-Za-z0-9]{3}-[A-Za-z0-9]{3}|[A-Za-z0-9]{4}-[A-Za-z0-9]{4}|[A-Z]-\d{6})/g);
-      if (candidates) {
-        for (const c of candidates) {
-          const raw = c.replace(/^[A-Z]-/, '').replace(/-/g, '');
-          if (isValidCode(raw)) {
-            return c;
-          }
-        }
+    // A. 验证码独占下一行（最强信号）：如 "code is:\n 034540"
+    if (nextLine && /^[A-Za-z0-9-]{4,10}$/.test(nextLine)) {
+      const raw = nextLine.replace(/^[A-Z]-/, '').replace(/-/g, '');
+      if (isValidCode(raw)) {
+        return nextLine;
       }
+    }
+
+    const searchScope = line + ' ' + nextLine;
+
+    // B. 作用域内的纯数字候选（次强信号）
+    const digitMatch = searchScope.match(/\b\d{4,8}\b/);
+    if (digitMatch && isValidCode(digitMatch[0])) {
+      return digitMatch[0];
+    }
+
+    // C. 数字字母混合候选（弱信号）：必须含数字，排除纯字母单词与问候语后的收件人名
+    const candidates = searchScope.match(/([A-Za-z0-9]{4,8}|[A-Za-z0-9]{3}-[A-Za-z0-9]{3}|[A-Za-z0-9]{4}-[A-Za-z0-9]{4}|[A-Z]-\d{6})/g) || [];
+    for (const c of candidates) {
+      if (!/\d/.test(c)) continue; // 纯字母几乎都是普通单词，直接跳过
+      const raw = c.replace(/^[A-Z]-/, '').replace(/-/g, '');
+      if (!isValidCode(raw)) continue;
+      // 排除问候语后紧跟的收件人名（Hello f9h2msu6,）
+      const pos = searchScope.indexOf(c);
+      if (pos > 0 && /(?:hello|hi|dear|welcome)[,:\s]+$/i.test(searchScope.slice(Math.max(0, pos - 12), pos))) {
+        continue;
+      }
+      return c;
     }
   }
 
@@ -211,9 +230,18 @@ function isValidCode(str) {
   // 排除常见英语单词与品牌名
   const ignoredWords = [
     'NULL', 'TRUE', 'FALSE', 'TEST', 'INFO', 'POST', 'USER', 'MAIL', 'HTML', 'HTTP',
-    'GOOGLE', 'GITHUB', 'NOTION', 'STEAM', 'APPLE', 'DISCORD', 'MICROSOFT', 'TWITTER', 'OPENAI'
+    'GOOGLE', 'GITHUB', 'NOTION', 'STEAM', 'APPLE', 'DISCORD', 'MICROSOFT', 'TWITTER', 'OPENAI',
+    'CODEX', 'VERIFICATION', 'CODE', 'EMAIL', 'MIRROR', 'HELLO', 'WELCOME', 'THANKS', 'PLEASE',
+    'CONFIRM', 'VERIFY', 'ACTIVATE', 'SECURITY', 'AUTH', 'TOKEN', 'PASSCODE', 'OTP', 'PIN',
+    'VALID', 'EXPIRE', 'MINUTE', 'MINUTES', 'HOUR', 'HOURS', 'IGNORE', 'REQUEST', 'SENT', 'REPLY'
   ];
   if (ignoredWords.includes(s.toUpperCase())) return false;
+
+  // 优先数字验证码：若候选全是字母且存在纯数字备选，倾向拒绝纯字母（避免品牌词误判）
+  if (/^[A-Za-z]+$/.test(s)) {
+    // 这里无法直接访问其他候选，交给评分阶段处理；但可加一条：纯字母且长度不等于6时更严格
+    if (s.length !== 6) return false; // 常见字母验证码多为6位（如 G-123456 已在格式阶段处理）
+  }
 
   return true;
 }

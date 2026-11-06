@@ -11,7 +11,7 @@ import {
   buildRuleFromAI,
   extractDomain
 } from './rule-store.js';
-import { extractWithAI } from './ai-extractor.js';
+import { extractWithAI, saveAiLog, pingAI } from './ai-extractor.js';
 import { extractVerificationCode } from './code-extractor.js';
 
 export async function handleApiRequest(request, env, ctx) {
@@ -235,6 +235,9 @@ export async function handleApiRequest(request, env, ctx) {
 
       // 先尝试第 1 层正则
       let code = extractVerificationCode(mail.subject || '', mail.content_text || '', mail.content_html || '');
+      let aiUsed = false;
+      let aiConfidence = 0;
+      let aiReason = '';
 
       // 若正则未命中，调用 AI 兜底
       if (!code) {
@@ -244,6 +247,9 @@ export async function handleApiRequest(request, env, ctx) {
           htmlBody: mail.content_html || ''
         });
         code = aiResult.code;
+        aiUsed = aiResult.usedAI;
+        aiConfidence = aiResult.confidence || 0;
+        aiReason = aiResult.reason || '';
       }
 
       if (!code) {
@@ -252,6 +258,19 @@ export async function handleApiRequest(request, env, ctx) {
           headers: corsHeaders
         });
       }
+
+      // 记录手动触发 AI 学习的日志
+      ctx.waitUntil(saveAiLog(env, {
+        type: 'learn',
+        from: mail.from,
+        domain: fromDomain,
+        subject: mail.subject || '',
+        aiExtracted: aiUsed,
+        extractedCode: code || null,
+        confidence: aiConfidence,
+        reason: aiReason || '手动触发 AI 重新学习',
+        timestamp: Date.now()
+      }));
 
       // 写入/更新 KV 规则（自学习）
       const existingRule = await getRule(env, key);
@@ -279,6 +298,36 @@ export async function handleApiRequest(request, env, ctx) {
       await putRule(env, key, newRule);
 
       return new Response(JSON.stringify({ code: 0, message: 'Rule learned', key, extractedCode: code }), { headers: corsHeaders });
+    }
+
+    // API 8: 查询 AI 工作日志（管理页面使用）
+    // GET /api/admin/logs?tab=extract|learn
+    if (url.pathname === '/api/admin/logs' && request.method === 'GET') {
+      const tab = url.searchParams.get('tab') || 'extract';
+      const prefix = `ailog:`;
+      const listRes = await env.MAIL_KV.list({ prefix });
+      const logs = [];
+      for (const obj of listRes.keys || []) {
+        const raw = await env.MAIL_KV.get(obj.name);
+        if (!raw) continue;
+        try {
+          const log = JSON.parse(raw);
+          if (tab && log.type !== tab) continue;
+          logs.push(log);
+        } catch {
+          // 跳过损坏的日志条目
+        }
+      }
+      logs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      return new Response(JSON.stringify({ code: 0, data: logs }), { headers: corsHeaders });
+    }
+
+    // API 9: Ping AI 模型，验证 LLM 调用链路是否正常（?force=1 忽略熔断强制实测）
+    // GET /api/admin/ping-ai
+    if (url.pathname === '/api/admin/ping-ai' && request.method === 'GET') {
+      const force = url.searchParams.get('force') === '1';
+      const result = await pingAI(env, { force });
+      return new Response(JSON.stringify({ code: result.ok ? 0 : 1, data: result }), { headers: corsHeaders });
     }
 
     return new Response(JSON.stringify({ code: 404, error: 'Endpoint Not Found' }), { status: 404, headers: corsHeaders });

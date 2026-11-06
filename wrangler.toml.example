@@ -7,14 +7,19 @@ binding = "MAIL_KV"
 id = "你的生产_KV_ID"
 preview_id = "你的预览_KV_ID"
 
+# Cloudflare Workers AI 绑定：外部 AI 供应商失败/被限流时的内置兜底通道（强烈建议开启）
+[ai]
+binding = "AI"
+
 [vars]
 DOMAIN = "你的域名.com"           # 替换为你的真实域名
 MAIL_TTL_SECONDS = 1800            # 邮件保留时间（秒），默认 30 分钟
+AI_FALLBACK_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct"   # Workers AI 兜底模型（中文与 JSON 输出可靠）
 
 # ──── AI 自学习验证码提取（可选）────
-# 通过 Cloudflare 密钥存储或 wrangler.toml 的 [vars] 配置，严禁写入代码或提交到 Git
-AI_PROVIDER = "openai"             # openai / zhipu / deepseek / cloudflare
-AI_API_KEY = "sk-your-api-key"     # 替换为你的真实密钥
+# 外部供应商（OpenAI 兼容）。密钥请用 `wrangler secret put AI_API_KEY` 配置，严禁写入本文件或提交到 Git。
+# 未配置外部供应商时，将直接使用上面的 Workers AI 兜底通道。
+AI_PROVIDER = "openai"             # openai / zhipu / deepseek / cloudflare（仅作记录，调用以 AI_API_BASE 为准）
 AI_API_BASE = "https://api.openai.com/v1"
 AI_MODEL = "gpt-3.5-turbo"
 AI_MAX_DAILY_CALLS = 100           # 每日最大 AI 调用次数
